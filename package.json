@@ -1,0 +1,14 @@
+{
+  "name": "chatgpt-web2api",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible API server for ChatGPT web (no browser)",
+  "main": "chatgpt_nobrowser.py",
+  "scripts": {
+    "start": "python3 chatgpt_nobrowser.py --port 8082"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "jsdom": "^30.1.3"
+  }
+}

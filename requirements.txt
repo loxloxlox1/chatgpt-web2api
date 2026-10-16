@@ -1,0 +1,3 @@
+requirements:
+curl_cffi>=0.16
+aiohttp>=3.9
