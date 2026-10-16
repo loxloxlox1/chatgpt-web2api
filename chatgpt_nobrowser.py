@@ -89,18 +89,33 @@ class Account:
 
     async def _run_vm(self, chatreq: dict):
         uid = str(uuid.uuid4())
+        if not os.path.isdir(os.path.join(JSDOM_DIR, "node_modules", "jsdom")):
+            raise RuntimeError(
+                "jsdom not installed — run `npm install` in the project directory")
         proc = await asyncio.create_subprocess_exec(
             "node", os.path.join(DIR, "sentinel_jsdom3.js"),
             cwd=JSDOM_DIR,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(proc.communicate(
-            (json.dumps(chatreq) + "\ndummy\n" +
-             self.cfg.get("oai_did", "") + "\n" + uid + "\n").encode()), timeout=45)
+            stderr=asyncio.subprocess.PIPE)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(
+                (json.dumps(chatreq) + "\ndummy\n" +
+                 self.cfg.get("oai_did", "") + "\n" + uid + "\n").encode()), timeout=45)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError("sentinel VM timeout (45s)")
         line = out.decode().strip().split("\n")[-1]
+        if not line:
+            raise RuntimeError("sentinel VM produced no output: "
+                               + err.decode()[-500:])
         if line.startswith("ERR:"):
             raise RuntimeError(f"sentinel VM: {line}")
-        return json.loads(line), uid
+        try:
+            tok = json.loads(line)
+        except json.JSONDecodeError:
+            raise RuntimeError("sentinel VM bad output: "
+                               + (line[:200] or err.decode()[-300:]))
+        return tok, uid
 
     async def sentinel_token(self):
         # pass A: sentinel.openai.com req tokens (needed to talk to chat-requirements)
