@@ -276,17 +276,40 @@ class Pool:
 async def run_server(pool, port):
     from aiohttp import web
 
-    def sse(delta=None, finish=None, model="chatgpt-web", cid=None, usage=None):
+    def sse(delta=None, finish=None, model="chatgpt-web", cid=None, usage=None, tool_calls=None):
         d = {}
-        if finish is None:
+        if tool_calls is not None:
+            d = {"role": "assistant", "tool_calls": tool_calls}
+        elif finish is None:
             d = {"role": "assistant"} if delta == "" else ({"content": delta} if delta is not None else {})
         o = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
              "model": model, "choices": [{"index": 0, "delta": d, "finish_reason": finish}]}
         if usage: o["usage"] = usage
         return "data: " + json.dumps(o) + "\n\n"
 
-    def build_prompt(msgs):
+    def build_prompt(msgs, tools=None, tool_call_active=False):
         parts = []
+        tool_block = None
+        if tools:
+            tl = []
+            for t in tools:
+                f = t.get("function", t)
+                tl.append({"name": f.get("name"),
+                           "description": f.get("description", ""),
+                           "parameters": f.get("parameters", {})})
+            tool_block = (
+                "[TOOLS — STRICT PROTOCOL] You have real function-calling tools connected. "
+                "To call a tool, reply with ONLY this JSON and nothing else: "
+                '{"tool_calls": [{"name": "<tool>", "arguments": {...}}]} '
+                "(no markdown, no explanation, no other text). The runtime will execute it and "
+                "send back the result. You do NOT have the data yourself — you CANNOT run "
+                "commands, read files or know the current time without calling a tool. "
+                "If the user asks anything requiring a tool, you MUST call it. Only answer "
+                "directly when no tool is needed. Tools:\n"
+                + json.dumps(tl, ensure_ascii=False))
+        if tool_call_active:
+            parts.append("[Tool results received] Use them to answer the user. "
+                         "You may call more tools with the same JSON format if needed.")
         for m in msgs:
             role, content = m.get("role"), m.get("content", "")
             if isinstance(content, list):
@@ -296,27 +319,140 @@ async def run_server(pool, port):
             elif role == "user":
                 parts.append(f"User: {content}")
             elif role == "assistant":
-                parts.append(f"Assistant: {content}")
+                tc = m.get("tool_calls")
+                if tc:
+                    calls = []
+                    for c in tc:
+                        fn = c.get("function", {})
+                        calls.append({"name": fn.get("name"),
+                                      "arguments": fn.get("arguments", "")})
+                    parts.append(f"Assistant (tool call): {json.dumps(calls, ensure_ascii=False)}")
+                else:
+                    parts.append(f"Assistant: {content}")
+            elif role == "tool":
+                parts.append(f"[Tool {m.get('name','') or 'tool'} result]: {content}")
+        if tool_block and not tool_call_active:
+            parts.append(tool_block)
+            parts.append("ВАЖНО: перечисленные выше инструменты РЕАЛЬНО подключены к этой сессии. "
+                         "Если для ответа нужен инструмент (команда, файл, время и т.п.) — "
+                         "ответь ТОЛЬКО валидным JSON вида {\"tool_calls\": [{\"name\": ..., "
+                         "\"arguments\": {...}}]} без какого-либо другого текста. Не пиши, что "
+                         "у тебя нет инструментов — они есть.")
         parts.append("Assistant:")
         return "\n\n".join(parts)
 
     async def completions(request):
         body = await request.json()
-        prompt = build_prompt(body.get("messages", []))
+        msgs = body.get("messages", [])
+        tools = body.get("tools") or []
+        # detect tool-result phase: last message role == "tool"
+        tool_call_active = bool(msgs) and msgs[-1].get("role") == "tool"
+        prompt = build_prompt(msgs, tools=tools, tool_call_active=tool_call_active)
         stream = bool(body.get("stream"))
         model = body.get("model", "chatgpt-web")
         cid = "chatcmpl-" + str(uuid.uuid4())
         zero = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        if not stream:
+        async def collect():
             parts, acc = [], None
             async for name, delta in pool.ask(prompt):
                 parts.append(delta); acc = name
+            return "".join(parts), acc
+
+        def parse_tool_calls(text):
+            """model may answer with {"tool_calls":[{name,arguments}]} JSON"""
+            t = text.strip()
+            # strip code fences
+            if t.startswith("```"):
+                t = t.strip("`")
+                if t.startswith("json"):
+                    t = t[4:]
+                t = t.strip()
+            if not t.startswith("{"):
+                return None
+            try:
+                j = json.loads(t)
+            except json.JSONDecodeError:
+                # try to find the last balanced JSON object in text
+                i = text.find('{"tool_calls"')
+                if i < 0:
+                    return None
+                depth = 0
+                for k in range(i, len(text)):
+                    if text[k] == "{":
+                        depth += 1
+                    elif text[k] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                j = json.loads(text[i:k+1])
+                            except json.JSONDecodeError:
+                                return None
+                            break
+                else:
+                    return None
+            calls = j.get("tool_calls")
+            if not isinstance(calls, list) or not calls:
+                return None
+            out = []
+            for n, c in enumerate(calls):
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("name") or c.get("tool") or ""
+                args = c.get("arguments", c.get("args", "{}"))
+                if not name:
+                    # salvage: single unknown-name entry → still return with placeholder
+                    # so the runtime returns an error and the model corrects itself
+                    name = "unknown_tool"
+                if isinstance(args, dict) and "arguments" in args and len(args) == 1:
+                    args = args["arguments"]  # model wrapped args twice
+                out.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": name,
+                                 "arguments": args if isinstance(args, str)
+                                              else json.dumps(args, ensure_ascii=False)}})
+            return out or None
+
+        async def collect_with_retry():
+            text, acc = await collect()
+            if tools and not tool_call_active and parse_tool_calls(text) is None:
+                # up to 2 nudges — web model randomly denies having tools
+                for attempt in range(2):
+                    retry_prompt = (prompt
+                                    + "\n\n[System] Твой предыдущий ответ был НЕВАЛИДНЫМ "
+                                    "JSON вызова инструмента: " + repr(text[:200])
+                                    + '\nПравильный формат СТРОГО: {"tool_calls": '
+                                    '[{"name": "<имя инструмента из списка>", '
+                                    '"arguments": {<аргументы по схеме>}}]} '
+                                    "— одно имя из списка, аргументы строго по parameters. "
+                                    "Ответь заново ТОЛЬКО валидным JSON.")
+                    parts2 = []
+                    acc2 = None
+                    async for name, delta in pool.ask(retry_prompt):
+                        parts2.append(delta); acc2 = name
+                    t2 = "".join(parts2)
+                    if parse_tool_calls(t2):
+                        return t2, acc2
+            return text, acc
+
+        if not stream:
+            text, acc = await collect_with_retry()
+            tcalls = parse_tool_calls(text) if tools else None
+            if tcalls:
+                return web.json_response({
+                    "id": cid, "object": "chat.completion", "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0,
+                                 "message": {"role": "assistant", "content": None,
+                                             "tool_calls": tcalls},
+                                 "finish_reason": "tool_calls"}],
+                    "usage": zero, "_account": acc})
             return web.json_response({
                 "id": cid, "object": "chat.completion", "created": int(time.time()),
                 "model": model,
                 "choices": [{"index": 0,
-                             "message": {"role": "assistant", "content": "".join(parts)},
+                             "message": {"role": "assistant", "content": text},
                              "finish_reason": "stop"}],
                 "usage": zero, "_account": acc})
 
@@ -327,10 +463,16 @@ async def run_server(pool, port):
         await resp.prepare(request)
         try:
             await resp.write(sse(delta="", model=model, cid=cid).encode())
-            async for name, delta in pool.ask(prompt):
-                if delta:
-                    await resp.write(sse(delta=delta, model=model, cid=cid).encode())
-            await resp.write(sse(finish="stop", model=model, cid=cid, usage=zero).encode())
+            text, _ = await collect_with_retry()
+            tcalls = parse_tool_calls(text) if tools else None
+            if tcalls:
+                await resp.write(sse(delta=None, model=model, cid=cid,
+                                     tool_calls=tcalls,
+                                     finish="tool_calls", usage=zero).encode())
+            else:
+                if text:
+                    await resp.write(sse(delta=text, model=model, cid=cid).encode())
+                await resp.write(sse(finish="stop", model=model, cid=cid, usage=zero).encode())
             await resp.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, asyncio.CancelledError):
             pass
